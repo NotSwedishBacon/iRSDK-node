@@ -38,5 +38,13 @@ jobs:
       - name: Run tests
         run: npm test --if-present
 
+      - name: Skip if version already published
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if npm view iracing-node-sdk@${PKG_VERSION} version > /dev/null 2>&1; then
+            echo "Version ${PKG_VERSION} already exists. Skipping publish."
+            exit 0
+          fi
+          
       - name: Publish to npm (with OIDC provenance)
         run: npm publish --provenance
