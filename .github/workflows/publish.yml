@@ -45,6 +45,19 @@ jobs:
             echo "Version ${PKG_VERSION} already exists. Skipping publish."
             exit 0
           fi
-          
+  
+      - name: Wait for npm registry propagation
+        run: |
+          PKG=iracing-node-sdk
+          for i in {1..5}; do
+            echo "Checking npm registry for $PKG (attempt $i)..."
+            if npm info $PKG >/dev/null 2>&1; then
+              echo "✅ Registry ready"
+              break
+            fi
+            echo "⏳ Registry not ready yet, retrying in 60s..."
+            sleep 60
+          done
+  
       - name: Publish to npm (with OIDC provenance)
         run: npm publish --provenance
