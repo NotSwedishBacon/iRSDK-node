@@ -1,288 +1,168 @@
 #!/usr/bin/env python3
 """
-Full iRacing SDK regeneration & build script for Node.js bindings.
-Usage:
-    python scripts/update_sdk.py path/to/irsdk_X_Y.zip
-This script will:
- - Auto-create binding.gyp and package.json if missing
- - Extract all headers into third_party/irsdk/
- - Regenerate lib/constants.js/.d.ts, lib/structs.js/.d.ts, lib/index.js/.d.ts
- - Rebuild the native addon (node-gyp)
- - Generate VERIFICATION_REPORT.txt with checksums
- - Sync package.json version to match IRSDK_VER
+update_sdk.py — regenerates all Node bindings and metadata from an iRSDK ZIP.
+
+Features:
+  • Auto-detects iRSDK version from zip filename (e.g. irsdk_1_19.zip → 1.19.0)
+  • Keeps package.json version synced with SDK version
+  • Idempotently ensures binding.gyp is correct (include_dir fix, flags, etc.)
+  • Skips npm rebuild when running under CI
+  • Optionally bumps patch if version already exists on npm
 """
 
-import zipfile, os, re, hashlib, subprocess, sys, pathlib, json
+import os
+import re
+import json
+import zipfile
+import subprocess
+from pathlib import Path
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-THIRD = ROOT / "third_party" / "irsdk"
+ROOT = Path(__file__).resolve().parent.parent
 LIB = ROOT / "lib"
-REPORT = ROOT / "VERIFICATION_REPORT.txt"
+THIRD_PARTY = ROOT / "third_party" / "irsdk"
+PACKAGE_JSON = ROOT / "package.json"
+BINDING_GYP = ROOT / "binding.gyp"
 
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
 
-def strip_comments(s: str):
-    return re.sub(r"/\*.*?\*/", "", s, flags=re.S)
+# -----------------------------------------------------------------------------
+# Utility helpers
+# -----------------------------------------------------------------------------
+def derive_version_from_zip(zip_path: str) -> str:
+    """Extract semantic version from zip filename."""
+    m = re.search(r'(\d+)[._](\d+)(?:[._](\d+))?', zip_path)
+    if not m:
+        return "0.0.0"
+    major, minor, patch = m.groups(default="0")
+    return f"{major}.{minor}.{patch}"
 
-def hash_file(path): 
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
-# ---------------------------------------------------------------------------
-# Bootstrapping helpers
-# ---------------------------------------------------------------------------
+def bump_if_exists(version: str, pkg_name: str = "iracing-node-sdk") -> str:
+    """Check npm for existing version and bump patch if needed."""
+    try:
+        result = subprocess.run(
+            ["npm", "view", pkg_name, "versions", "--json"],
+            capture_output=True, text=True, check=True
+        )
+        versions = json.loads(result.stdout)
+        if version in versions:
+            parts = [int(x) for x in version.split(".")]
+            parts[-1] += 1
+            new_version = ".".join(map(str, parts))
+            print(f"⚠️  Version {version} already published, bumped to {new_version}")
+            return new_version
+    except Exception:
+        pass
+    return version
 
-def ensure_binding_gyp():
-    """Create a modern binding.gyp compatible with Node 20+ and node-addon-api."""
-    gyp_path = ROOT / "binding.gyp"
-    if gyp_path.exists():
-        return
+import shutil
 
-    gyp_template = {
-        "targets": [
-            {
-                "target_name": "irsdk",
-                "sources": [
-                    "src/irsdk_bindings.cc"
-                ],
-                # Modern node-addon-api include pattern; no dependencies key
-                "include_dirs": [
-                    "<!(node -p \"require('node-addon-api').include\")",
-                    "third_party/irsdk"
-                ],
-                "defines": ["NAPI_DISABLE_CPP_EXCEPTIONS"],
-                "cflags!": ["-fno-exceptions"],
-                "cflags_cc!": ["-fno-exceptions"],
-                "conditions": [
-                    ['OS=="win"', {
-                        "msvs_settings": {
-                            "VCCLCompilerTool": {"ExceptionHandling": 1}
-                        }
-                    }]
-                ]
-            }
-        ]
-    }
+def extract_zip(zip_path: str, target_dir: Path):
+    """Extracts the SDK zip into third_party/irsdk (cross-platform safe)."""
+    if target_dir.exists():
+        print(f"🧹 Cleaning old SDK directory: {target_dir}")
+        shutil.rmtree(target_dir, ignore_errors=True)
 
-    import json
-    gyp_path.write_text(json.dumps(gyp_template, indent=2), encoding="utf-8")
-    print("Created default binding.gyp (modern node-addon-api format)")
+    target_dir.mkdir(parents=True, exist_ok=True)
 
-def update_package_json(sdk_ver: str):
-    """Create or update package.json to sync version with SDK."""
-    pkg_path = ROOT / "package.json"
-    base_pkg = {
-        "name": "iracing-node-sdk",
-        "version": f"1.{sdk_ver}.0",
-        "description": "Node.js bindings for the official iRacing SDK",
-        "main": "lib/index.js",
-        "types": "lib/index.d.ts",
-        "files": ["lib", "build/Release", "third_party/irsdk"],
-        "scripts": {
-            "update-sdk": "python ./scripts/update_sdk.py",
-            "build": "node-gyp rebuild",
-            "release": "npm version patch && npm publish"
-        },
-        "keywords": ["iracing", "telemetry", "sdk", "node-addon", "simracing"],
-        "author": "Your Name <you@example.com>",
-        "license": "MIT",
-        "dependencies": {},
-        "gypfile": True
-    }
-
-    if pkg_path.exists():
-        pkg = json.loads(pkg_path.read_text(encoding="utf-8"))
-        pkg["version"] = f"1.{sdk_ver}.0"
-        pkg["main"] = base_pkg["main"]
-        pkg["types"] = base_pkg["types"]
-        pkg["files"] = base_pkg["files"]
-        pkg["scripts"] = {**base_pkg["scripts"], **pkg.get("scripts", {})}
-    else:
-        pkg = base_pkg
-
-    pkg_path.write_text(json.dumps(pkg, indent=2), encoding="utf-8")
-    print(f"Updated package.json to version 1.{sdk_ver}.0")
-
-# ---------------------------------------------------------------------------
-# Header extraction and parsing
-# ---------------------------------------------------------------------------
-
-def extract_headers(zip_path: pathlib.Path):
     with zipfile.ZipFile(zip_path) as z:
-        for name in z.namelist():
-            if not name.lower().endswith((".h", ".hpp", ".cpp")):
-                continue
-            rel = pathlib.Path(name).name
-            dst = THIRD / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            with z.open(name) as src, open(dst, "wb") as out:
-                out.write(src.read())
+        z.extractall(target_dir)
 
-def parse_defines_enums_structs(text: str):
-    text = strip_comments(text)
-    defines, strings, enums, structs = [], [], [], []
-    for line in text.splitlines():
-        m = re.match(r"\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\s+(.*)", line)
-        if m:
-            name, val = m.group(1), re.split(r"//", m.group(2))[0].strip()
-            if "(" not in name and val:
-                defines.append((name, val))
-    for m in re.finditer(r"static\s+const\s+_TCHAR\s+([A-Za-z_][A-Za-z0-9_]*)\[\s*\]\s*=\s*_T\((\".*?\")\)", text):
-        strings.append((m.group(1), m.group(2)))
-    for m in re.finditer(r"enum\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{(.*?)\};", text, flags=re.S):
-        ename, body = m.group(1), m.group(2)
-        items = []
-        for raw in body.split(","):
-            raw = re.split(r"//", raw)[0].strip()
-            if not raw:
-                continue
-            mm = re.match(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:=\s*(.+))?$", raw)
-            if mm:
-                items.append((mm.group(1), (mm.group(2) or "").strip()))
-        enums.append((ename, items))
-    for m in re.finditer(r"struct\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{(.*?)\};", text, flags=re.S):
-        sname, body = m.group(1), m.group(2)
-        fields = []
-        for stmt in body.split(";"):
-            stmt = re.split(r"//", stmt)[0].strip()
-            if not stmt:
-                continue
-            mm = re.match(r"([A-Za-z_][A-Za-z0-9_\s\*]+)\s+([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]+\])?$", stmt)
-            if mm:
-                ctype, fname, arr = mm.groups()
-                arr = arr or ""
-                ts_type = "number"
-                if "*" in ctype or "char" in ctype:
-                    ts_type = "string" if "char" in ctype else "number[]"
-                elif "bool" in ctype:
-                    ts_type = "boolean"
-                fields.append((fname, ts_type, ctype.strip(), arr))
-        structs.append((sname, fields))
-    return defines, strings, enums, structs
+    print(f"✅ Extracted {zip_path} → {target_dir}")
 
-# ---------------------------------------------------------------------------
-# File generation
-# ---------------------------------------------------------------------------
 
-def emit_js_and_dts(defines, strings, enums, structs):
-    LIB.mkdir(parents=True, exist_ok=True)
 
-    # constants.js
-    js_lines = ["// Auto-generated constants from iRacing SDK"]
-    for name, s in strings:
-        js_lines.append(f'export const {name} = {s};')
-    for name, val in defines:
-        js_lines.append(f'export const {name} = {val};')
-    for ename, items in enums:
-        js_lines.append(f'\nexport const {ename} = {{')
-        for nm, expr in items:
-            rhs = expr if expr else "undefined"
-            js_lines.append(f'  {nm}: {rhs},')
-        js_lines.append('};')
-    (LIB / "constants.js").write_text("\n".join(js_lines), encoding="utf-8")
+def ensure_binding_gyp(root: Path):
+    """Ensure binding.gyp is consistent and includes all required paths."""
+    desired = {
+        "targets": [{
+            "target_name": "irsdk",
+            "sources": ["src/irsdk_bindings.cc"],
+            "include_dirs": [
+                "<!(node -p \"require('node-addon-api').include\")",
+                "<!(node -p \"require('node-addon-api').include_dir\")",
+                "third_party/irsdk"
+            ],
+            "dependencies": [
+                "<!(node -p \"require('node-addon-api').gyp\")"
+            ],
+            "cflags!": ["-fno-exceptions"],
+            "cflags_cc!": ["-fno-exceptions"],
+            "defines": ["NAPI_DISABLE_CPP_EXCEPTIONS"],
+            "libraries": []
+        }]
+    }
+    gyp_path = root / "binding.gyp"
+    if not gyp_path.exists():
+        print("📘 Creating new binding.gyp")
+        with open(gyp_path, "w", encoding="utf-8") as f:
+            json.dump(desired, f, indent=2)
+    else:
+        with open(gyp_path, "r+", encoding="utf-8") as f:
+            try:
+                current = json.load(f)
+            except json.JSONDecodeError:
+                current = {}
+            current["targets"] = desired["targets"]
+            f.seek(0)
+            json.dump(current, f, indent=2)
+            f.truncate()
+        print("🔧 Verified binding.gyp consistency.")
 
-    # constants.d.ts
-    dts_lines = ["// Type definitions for constants"]
-    for name, s in strings:
-        dts_lines.append(f'export const {name}: string;')
-    for name, val in defines:
-        dts_lines.append(f'export const {name}: number;')
-    for ename, items in enums:
-        dts_lines.append(f'export namespace {ename} {{')
-        for nm, _ in items:
-            dts_lines.append(f'  const {nm}: number;')
-        dts_lines.append('}')
-    (LIB / "constants.d.ts").write_text("\n".join(dts_lines), encoding="utf-8")
 
-    # structs.js
-    sj = ["// Auto-generated struct placeholders"]
-    for sname, fields in structs:
-        sj.append(f'export const {sname} = {{')
-        for fname, _, _, _ in fields:
-            sj.append(f'  {fname}: undefined,')
-        sj.append('};')
-    (LIB / "structs.js").write_text("\n".join(sj), encoding="utf-8")
+def update_package_json(version: str):
+    """Update package.json with the given version."""
+    if not PACKAGE_JSON.exists():
+        raise FileNotFoundError("package.json not found")
 
-    # structs.d.ts
-    sd = ["// Type definitions for structs"]
-    for sname, fields in structs:
-        sd.append(f'export interface {sname} ' + "{")
-        for fname, ts_type, ctype, arr in fields:
-            sd.append(f'  /** {ctype}{arr} */')
-            sd.append(f'  {fname}: {ts_type};')
-        sd.append("}")
-    (LIB / "structs.d.ts").write_text("\n".join(sd), encoding="utf-8")
+    with open(PACKAGE_JSON, "r+", encoding="utf-8") as f:
+        pkg = json.load(f)
+        pkg["version"] = version
+        f.seek(0)
+        json.dump(pkg, f, indent=2)
+        f.truncate()
 
-    # index.js + d.ts
-    js_index = """// Auto-generated entrypoint
-import * as constants from './constants.js';
-import * as structs from './structs.js';
+    print(f"📦 Updated package.json → version {version}")
 
-export const IRSDK = {
-  ...constants,
-  ...structs
-};
 
-// Build banner
-import fs from 'fs';
-import path from 'path';
-const reportPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../VERIFICATION_REPORT.txt');
-try {
-  const text = fs.readFileSync(reportPath, 'utf8');
-  const hashMatch = text.match(/irsdk_defines\\.h:\\s*([a-f0-9]{64})/i);
-  const shortHash = hashMatch ? hashMatch[1].slice(0, 8) : 'unknown';
-  const sdkMatch = text.match(/IRSDK_VER\\s+(\\d+)/);
-  const sdkVersion = sdkMatch ? sdkMatch[1] : 'unknown';
-  console.log(`[iRSDK] Linked against iRacing SDK v${sdkVersion} (hash ${shortHash})`);
-} catch {}"""
-    (LIB / "index.js").write_text(js_index, encoding="utf-8")
+def npm_rebuild_if_local():
+    """Rebuild locally if not running in CI."""
+    if os.environ.get("CI", "").lower() == "true":
+        print("🧩 CI environment detected, skipping npm rebuild.")
+        return
+    print("🔨 Rebuilding native addon locally...")
+    subprocess.run(["npm", "rebuild"], cwd=ROOT, check=True, shell=True)
 
-    dts_index = """import * as constants from './constants.js';
-import * as structs from './structs.js';
-export const IRSDK: typeof constants & typeof structs;"""
-    (LIB / "index.d.ts").write_text(dts_index, encoding="utf-8")
 
-# ---------------------------------------------------------------------------
-# Verification
-# ---------------------------------------------------------------------------
-
-def verify_headers():
-    report = ["Verification report:", "====================="]
-    for f in sorted(THIRD.glob("*.h")):
-        report.append(f"{f.name}: {hash_file(f)}")
-    REPORT.write_text("\n".join(report), encoding="utf-8")
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
+# -----------------------------------------------------------------------------
+# Main process
+# -----------------------------------------------------------------------------
 def main():
-    if len(sys.argv) < 2:
-        sys.exit("Usage: update_sdk.py path/to/irsdk_X_Y.zip")
-    zip_path = pathlib.Path(sys.argv[1])
-    if not zip_path.exists():
-        sys.exit(f"SDK zip not found: {zip_path}")
+    # find the latest irsdk_*.zip in the repo root
+    zips = list(ROOT.glob("irsdk_*.zip"))
+    if not zips:
+        raise FileNotFoundError("No irsdk_*.zip found in project root.")
+    zip_path = str(sorted(zips)[-1])
+    print(f"📂 Using SDK archive: {zip_path}")
 
-    ensure_binding_gyp()
-    THIRD.mkdir(parents=True, exist_ok=True)
+    # derive and adjust npm version
+    raw_version = derive_version_from_zip(zip_path)
+    npm_version = bump_if_exists(raw_version)
+    print(f"📦 Detected SDK version {raw_version} → NPM version {npm_version}")
 
-    print(f"Extracting headers from {zip_path} ...")
-    extract_headers(zip_path)
-    defines_h = (THIRD / "irsdk_defines.h").read_text(encoding="utf-8", errors="ignore")
-    defines, strings, enums, structs = parse_defines_enums_structs(defines_h)
+    # extract SDK
+    extract_zip(zip_path, THIRD_PARTY)
 
-    match = re.search(r"#define\s+IRSDK_VER\s+(\d+)", defines_h)
-    sdk_ver = match.group(1) if match else "0"
-    update_package_json(sdk_ver)
+    # verify binding.gyp
+    ensure_binding_gyp(ROOT)
 
-    emit_js_and_dts(defines, strings, enums, structs)
-    verify_headers()
+    # update package.json version
+    update_package_json(npm_version)
 
-    print(f"Generated {len(defines)} defines, {len(enums)} enums, {len(structs)} structs.")
-    print("Rebuilding native addon...")
-    subprocess.run("npm install node-addon-api --no-audit --no-fund", cwd=ROOT, shell=True)
-    print(f"✅ SDK update complete. Version {sdk_ver}. Check VERIFICATION_REPORT.txt for details.")
+    # optional rebuild (skipped in CI)
+    npm_rebuild_if_local()
+
+    print("✅ SDK update complete.")
+
 
 if __name__ == "__main__":
     main()
