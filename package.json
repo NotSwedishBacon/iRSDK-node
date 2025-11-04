@@ -1,6 +1,6 @@
 {
   "name": "iracing-node-sdk",
-  "version": "1.19.2",
+  "version": "1.19.3",
   "description": "Node.js bindings for the official iRacing SDK",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
