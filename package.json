@@ -23,8 +23,8 @@
   ],
   "author": "Your Name <you@example.com>",
   "license": "MIT",
-  "dependencies": {
+  "gypfile": true,
+  "devDependencies": {
     "node-addon-api": "^8.5.0"
-  },
-  "gypfile": true
+  }
 }
