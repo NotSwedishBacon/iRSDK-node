@@ -1,0 +1,35 @@
+{
+  "targets": [
+    {
+      "target_name": "irsdk",
+      "sources": [
+        "src/irsdk_bindings.cc"
+      ],
+      "include_dirs": [
+        "<!(node -p \"require('node-addon-api').include\")",
+        "third_party/irsdk"
+      ],
+      "defines": [
+        "NAPI_DISABLE_CPP_EXCEPTIONS"
+      ],
+      "cflags!": [
+        "-fno-exceptions"
+      ],
+      "cflags_cc!": [
+        "-fno-exceptions"
+      ],
+      "conditions": [
+        [
+          "OS==\"win\"",
+          {
+            "msvs_settings": {
+              "VCCLCompilerTool": {
+                "ExceptionHandling": 1
+              }
+            }
+          }
+        ]
+      ]
+    }
+  ]
+}

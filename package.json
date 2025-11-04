@@ -1,0 +1,30 @@
+{
+  "name": "iracing-node-sdk",
+  "version": "1.0.0",
+  "description": "Node.js bindings for the official iRacing SDK",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "build/Release",
+    "third_party/irsdk"
+  ],
+  "scripts": {
+    "update-sdk": "python ./scripts/update_sdk.py",
+    "build": "node-gyp rebuild",
+    "release": "npm version patch && npm publish"
+  },
+  "keywords": [
+    "iracing",
+    "telemetry",
+    "sdk",
+    "node-addon",
+    "simracing"
+  ],
+  "author": "Your Name <you@example.com>",
+  "license": "MIT",
+  "dependencies": {
+    "node-addon-api": "^8.5.0"
+  },
+  "gypfile": true
+}
