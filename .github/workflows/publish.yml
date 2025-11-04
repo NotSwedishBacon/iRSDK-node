@@ -60,4 +60,4 @@ jobs:
           done
   
       - name: Publish to npm (with OIDC provenance)
-        run: npm publish --provenance
+        run: npm pack && npm publish --provenance --ignore-scripts

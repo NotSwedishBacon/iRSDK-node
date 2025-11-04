@@ -5,9 +5,11 @@
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "files": [
-    "lib",
-    "build/Release",
-    "third_party/irsdk"
+    "lib/",
+    "index.js",
+    "package.json",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "update-sdk": "python ./scripts/update_sdk.py",
