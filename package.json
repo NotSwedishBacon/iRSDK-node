@@ -27,5 +27,13 @@
   "license": "MIT",
   "devDependencies": {
     "node-addon-api": "^8.5.0"
+  },
+  "repository": {
+  "type": "git",
+  "url": "https://github.com/NotSwedishBacon/iRSDK-node"
+  },
+  "bugs": {
+    "url": "https://github.com/NotSwedishBacon/iRSDK-node/issues"
+  },
+  "homepage": "https://github.com/NotSwedishBacon/iRSDK-node#readme"
   }
-}
